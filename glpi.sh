@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # GLPI 10.0.24 — Production Deployment
-# Target: AlmaLinux / RHEL 9-10 + Rootless Podman + podman-compose + systemd
+# Target: RHEL 9.7 + Rootless Podman (native) + systemd
 #
 # Usage:
 #   sudo bash glpi.sh [--env /path/to/glpi.env] [--skip-build] [--skip-db]
@@ -13,6 +13,19 @@
 #   --dry-run       Print actions, write no files, start no services
 #
 # Idempotent: safe to re-run. Each section is self-guarding.
+#
+# RHEL 9.7 NOTES:
+#   • podman-compose is NOT used. All container orchestration is done via
+#     native podman commands (podman network, podman volume, podman run).
+#     This avoids the podman-compose AppStream availability problem entirely.
+#   • A shared podman network (glpi-net) connects the three containers.
+#   • Container startup order and health-gating is handled by the
+#     stack_up() function (waits for DB healthy before starting app, etc.).
+#   • systemd unit (glpi-compose.service) drives start/stop/reload using
+#     individual "podman start / podman stop" calls — no compose needed.
+#   • Section 9 (previously compose.yaml) now writes a human-readable
+#     reference file only; it is NOT consumed by any tooling.
+#   • nginx http2: "listen ... ssl http2" syntax kept for nginx < 1.25.
 # =============================================================================
 
 set -euo pipefail
@@ -21,9 +34,9 @@ IFS=$'\n\t'
 # ── Colour helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
+info()    { echo -e "${GREEN}[INF]${NC}   $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+die()     { echo -e "${RED}[ERR]${NC}    $*" >&2; exit 1; }
 ok()      { echo -e "  ${GREEN}[OK]${NC}    $*"; }
 section() {
   echo -e "\n${CYAN}${BOLD}══════════════════════════════════════════════════${NC}"
@@ -39,10 +52,10 @@ DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --env)       ENV_FILE="$2"; shift 2 ;;
+    --env)        ENV_FILE="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
-    --skip-db)   SKIP_DB=1; shift ;;
-    --dry-run)   DRY_RUN=1; shift ;;
+    --skip-db)    SKIP_DB=1; shift ;;
+    --dry-run)    DRY_RUN=1; shift ;;
     *) die "Unknown flag: $1. Usage: sudo bash glpi.sh [--env FILE] [--skip-build] [--skip-db] [--dry-run]" ;;
   esac
 done
@@ -51,8 +64,23 @@ done
 [[ -f "${ENV_FILE}" ]] || die "Environment file not found: ${ENV_FILE}\nCopy glpi.env.example to glpi.env and fill in your values."
 
 # ── Detect operator account (the real user behind sudo) ───────────────────────
-OPERATOR_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
-[[ "${OPERATOR_USER}" == "root" ]] && \
+_resolve_operator() {
+  local candidate="${SUDO_USER:-}"
+  if [[ -z "${candidate}" || "${candidate}" == "root" ]]; then
+    local loginuid
+    loginuid="$(cat /proc/self/loginuid 2>/dev/null || echo '')"
+    if [[ -n "${loginuid}" && "${loginuid}" != "4294967295" && "${loginuid}" != "0" ]]; then
+      candidate="$(getent passwd "${loginuid}" | cut -d: -f1 2>/dev/null || echo '')"
+    fi
+  fi
+  if [[ -z "${candidate}" || "${candidate}" == "root" ]]; then
+    candidate="$(logname 2>/dev/null || echo '')"
+  fi
+  echo "${candidate}"
+}
+
+OPERATOR_USER="$(_resolve_operator)"
+[[ -z "${OPERATOR_USER}" || "${OPERATOR_USER}" == "root" ]] && \
   die "Could not determine the operator account.\nRun as: sudo bash $0 (not from a root shell)"
 
 # ── Load environment ──────────────────────────────────────────────────────────
@@ -73,11 +101,17 @@ for _var in GLPI_HOSTNAME MAIL_HOST SMTP_HOST SMTP_FROM ZABBIX_HOST IDM_HOST; do
 done
 unset _var _val _clean
 
-# Derived values
+# Derived values (not in .env to avoid duplication)
 GLPI_WEBROOT="${GLPI_BASE}/webroot"
 IMG_GLPI_APP="localhost/glpi-app:${GLPI_VERSION}"
-COMPOSE_FILE="${GLPI_BASE}/compose.yaml"
-COMPOSE_NET_NAME="${COMPOSE_PROJECT}_glpi-net"
+GLPI_NET="${COMPOSE_PROJECT}_glpi-net"
+
+# Volume names — prefixed with project name to match compose conventions
+VOL_DB="${COMPOSE_PROJECT}_glpi-mariadb"
+VOL_CONFIG="${COMPOSE_PROJECT}_glpi-config"
+VOL_FILES="${COMPOSE_PROJECT}_glpi-files"
+VOL_LOG="${COMPOSE_PROJECT}_glpi-log"
+
 SECRETS_DIR="${GLPI_BASE}/secrets"
 
 [[ $DRY_RUN -eq 1 ]] && warn "DRY-RUN mode — no files written, no services started."
@@ -111,22 +145,15 @@ write_if_differs() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# ROOTLESS PODMAN HELPERS
+# All container operations run as GLPI_USER via runuser so they operate in
+# that user's rootless Podman namespace. Root's Podman namespace is separate.
+# ---------------------------------------------------------------------------
 _glpi_uid() { id -u "${GLPI_USER}"; }
 
-_user_docker_host() {
-  echo "unix:///run/user/$(_glpi_uid)/podman/podman.sock"
-}
-
-pc() {
-  local uid
-  uid="$(_glpi_uid)"
-  runuser -l "${GLPI_USER}" -s /bin/bash -c \
-    "XDG_RUNTIME_DIR=/run/user/${uid} \
-     DOCKER_HOST=unix:///run/user/${uid}/podman/podman.sock \
-     podman-compose -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} $*"
-}
-
 run_podman() {
+  # run_podman "subcommand args..."  — executes as GLPI_USER
   local uid
   uid="$(_glpi_uid)"
   runuser -l "${GLPI_USER}" -s /bin/bash -c \
@@ -135,31 +162,132 @@ run_podman() {
      podman $*"
 }
 
-_kill_glpi_containers() {
-  local port="$1"
-  pc "down --timeout 10" 2>/dev/null || true
-  for ctr in glpi-nginx glpi-app glpi-db; do
-    run_podman "rm -f ${ctr}" 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# NETWORK & VOLUME HELPERS
+# ---------------------------------------------------------------------------
+_ensure_network() {
+  if ! run_podman "network exists ${GLPI_NET}" 2>/dev/null; then
+    run_podman "network create ${GLPI_NET}"
+    ok "Created podman network: ${GLPI_NET}"
+  else
+    ok "Network already exists: ${GLPI_NET}"
+  fi
+}
+
+_ensure_volumes() {
+  for vol in "${VOL_DB}" "${VOL_CONFIG}" "${VOL_FILES}" "${VOL_LOG}"; do
+    if ! run_podman "volume exists ${vol}" 2>/dev/null; then
+      run_podman "volume create \
+        --label com.glpi.managed=true \
+        --label com.glpi.project=${COMPOSE_PROJECT} \
+        ${vol}"
+      ok "Created volume: ${vol}"
+    else
+      ok "Volume exists: ${vol}"
+    fi
   done
+}
+
+# ---------------------------------------------------------------------------
+# STACK UP — start containers in dependency order with health gating
+# ---------------------------------------------------------------------------
+stack_up() {
+  [[ $DRY_RUN -eq 1 ]] && { info "[dry-run] would start stack"; return; }
+
+  _ensure_network
+  _ensure_volumes
+
+  # ── glpi-db ────────────────────────────────────────────────────────────
+  if ! run_podman "inspect glpi-db --format '{{.State.Status}}'" 2>/dev/null | grep -q running; then
+    run_podman "rm -f glpi-db" 2>/dev/null || true
+    run_podman "run -d \
+      --name glpi-db \
+      --network ${GLPI_NET} \
+      --restart always \
+      --env-file ${SECRETS_DIR}/db.env \
+      --volume ${VOL_DB}:/var/lib/mysql:z \
+      --health-cmd 'mysqladmin ping -h 127.0.0.1 -u root --password=\$MARIADB_ROOT_PASSWORD || exit 1' \
+      --health-interval 10s \
+      --health-timeout 5s \
+      --health-retries 10 \
+      --health-start-period 30s \
+      ${IMG_MARIADB}"
+    ok "Started glpi-db"
+  else
+    ok "glpi-db already running"
+  fi
+
+  # ── glpi-app ───────────────────────────────────────────────────────────
+  if ! run_podman "inspect glpi-app --format '{{.State.Status}}'" 2>/dev/null | grep -q running; then
+    run_podman "rm -f glpi-app" 2>/dev/null || true
+    run_podman "run -d \
+      --name glpi-app \
+      --network ${GLPI_NET} \
+      --restart always \
+      --env-file ${SECRETS_DIR}/app.env \
+      --volume ${VOL_CONFIG}:/etc/glpi:z \
+      --volume ${VOL_FILES}:/var/lib/glpi:z \
+      --volume ${VOL_LOG}:/var/log/glpi:z \
+      --volume ${GLPI_WEBROOT}:/srv/glpi-webroot:z,shared \
+      --volume ${GLPI_BASE}/php-conf/glpi.ini:/usr/local/etc/php/conf.d/glpi.ini:ro,z \
+      --volume ${GLPI_BASE}/php-conf/www.conf:/usr/local/etc/php-fpm.d/www.conf:ro,z \
+      --volume ${GLPI_BASE}/logs/php-fpm-slow.log:/var/log/glpi/php-fpm-slow.log:z \
+      --health-cmd \"bash -c '</dev/tcp/127.0.0.1/9000' 2>/dev/null && echo ok || exit 1\" \
+      --health-interval 15s \
+      --health-timeout 5s \
+      --health-retries 5 \
+      --health-start-period 60s \
+      ${IMG_GLPI_APP}"
+    ok "Started glpi-app"
+  else
+    ok "glpi-app already running"
+  fi
+
+  # ── glpi-nginx ─────────────────────────────────────────────────────────
+  if ! run_podman "inspect glpi-nginx --format '{{.State.Status}}'" 2>/dev/null | grep -q running; then
+    run_podman "rm -f glpi-nginx" 2>/dev/null || true
+    run_podman "run -d \
+      --name glpi-nginx \
+      --network ${GLPI_NET} \
+      --restart always \
+      --publish 127.0.0.1:${POD_HOST_PORT}:${COMPOSE_PORT} \
+      --volume ${GLPI_BASE}/nginx-conf/glpi.conf:/etc/nginx/conf.d/default.conf:ro,z \
+      --volume ${GLPI_WEBROOT}:/srv/glpi-webroot:ro,z,shared \
+      --health-cmd \"curl -sf http://127.0.0.1:${COMPOSE_PORT}/healthz || exit 1\" \
+      --health-interval 15s \
+      --health-timeout 5s \
+      --health-retries 5 \
+      --health-start-period 30s \
+      ${IMG_NGINX}"
+    ok "Started glpi-nginx"
+  else
+    ok "glpi-nginx already running"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# STACK DOWN — stop and remove all three containers (volumes/network kept)
+# ---------------------------------------------------------------------------
+stack_down() {
+  local port="${POD_HOST_PORT}"
+
   for ctr in glpi-nginx glpi-app glpi-db; do
+    run_podman "stop --time 10 ${ctr}" 2>/dev/null || true
+    run_podman "rm   -f        ${ctr}" 2>/dev/null || true
     podman rm -f "${ctr}" 2>/dev/null || true
   done
+
   pkill -f "rootlessport.*${port}" 2>/dev/null || true
   runuser -l "${GLPI_USER}" -s /bin/bash -c \
     "pkill -f 'rootlessport.*${port}'" 2>/dev/null || true
   fuser -k "${port}/tcp" 2>/dev/null || true
-  sleep 2
-}
 
-compose_down() {
-  local port="${POD_HOST_PORT}"
-  _kill_glpi_containers "${port}"
+  sleep 2
+
   if ss -tlnp 2>/dev/null | grep -q ":${port}\\b"; then
     warn "Port ${port} still bound after full teardown."
   fi
 }
-
-compose_up() { pc "up -d"; }
 
 wait_container_status() {
   local name="$1" want="$2" tries="${3:-60}" sleep_s="${4:-2}"
@@ -177,9 +305,9 @@ section "0. Preflight checks"
 
 if ss -tlnp 2>/dev/null | grep -q ":${POD_HOST_PORT}\\b"; then
   warn "Port ${POD_HOST_PORT} already bound — clearing stale containers..."
-  _kill_glpi_containers "${POD_HOST_PORT}"
+  stack_down
   if ss -tlnp 2>/dev/null | grep -q ":${POD_HOST_PORT}\\b"; then
-    die "Port ${POD_HOST_PORT} still in use. Run: fuser -k ${POD_HOST_PORT}/tcp"
+    die "Port ${POD_HOST_PORT} still in use after all cleanup attempts."
   fi
   ok "Port ${POD_HOST_PORT} cleared."
 else
@@ -191,35 +319,39 @@ ok "Preflight checks passed."
 # ── Section 1: Packages ───────────────────────────────────────────────────────
 section "1. Host packages and services"
 
+[[ $DRY_RUN -eq 0 ]] && dnf module enable -y container-tools 2>/dev/null || \
+  warn "container-tools module enable failed — repo may already be active."
+
 [[ $DRY_RUN -eq 0 ]] && dnf update -y
 
 dnf_pkgs=(
-  podman podman-compose
+  podman
   netavark aardvark-dns
   firewalld nginx openssl
   jq curl nftables rsync
   policycoreutils-python-utils container-selinux
-  systemd-resolved
   checkpolicy policycoreutils setools-console
-  acl
+  acl psmisc iproute tzdata
 )
 
 [[ $DRY_RUN -eq 0 ]] && dnf install -y "${dnf_pkgs[@]}"
 
 need_cmd podman
-need_cmd podman-compose
 need_cmd nginx
 need_cmd firewall-cmd
+need_cmd jq
+need_cmd curl
+need_cmd fuser
+need_cmd ss
 
 [[ $DRY_RUN -eq 0 ]] && {
   systemctl enable --now firewalld
   systemctl enable --now podman.socket
   systemctl enable --now nginx
-  systemctl enable --now systemd-resolved
   ok "Host services enabled."
 }
 
-# ── Section 2: Service user ───────────────────────────────────────────────────
+# ── Section 2: Service user ──────────────────────────��────────────────────────
 section "2. Rootless service user: ${GLPI_USER}"
 
 if ! id "${GLPI_USER}" &>/dev/null; then
@@ -301,7 +433,7 @@ WRAPEOF
   ok "Convenience wrapper written: /usr/local/bin/podman-glpi"
 }
 
-# ── Section 3: Firewall ──────────────────────────────────────────────────��────
+# ── Section 3: Firewall ───────────────────────────────────────────────────────
 section "3. Firewall rules"
 
 [[ $DRY_RUN -eq 0 ]] && {
@@ -313,25 +445,25 @@ section "3. Firewall rules"
   ok "Firewall rules applied."
 }
 
-[[ $DRY_RUN -eq 0 ]] && hostnamectl set-hostname "${GLPI_HOSTNAME}"
+hostnamectl set-hostname "${GLPI_HOSTNAME}"
 
 # ── Section 4: /etc/hosts injection ──────────────────────────────────────────
 section "4. /etc/hosts — internal service hosts"
 
 inject_host() {
-  local host="$1"
-  if grep -qP "\\b${host}\\b" /etc/hosts 2>/dev/null; then
+  local ip="$1" host="$2"
+  if grep -qP "^\s*${ip}\s+.*\b${host}\b" /etc/hosts 2>/dev/null; then
     ok "${host} already in /etc/hosts"
   else
-    [[ $DRY_RUN -eq 0 ]] && echo "127.0.0.1  ${host}" >> /etc/hosts
-    ok "Injected: ${host}"
+    [[ $DRY_RUN -eq 0 ]] && echo "${ip}  ${host}" >> /etc/hosts
+    ok "Injected: ${ip}  ${host}"
   fi
 }
 
-[[ -n "${MAIL_HOST}" ]] && inject_host "${MAIL_HOST}"
-[[ -n "${ZABBIX_HOST}" ]] && inject_host "${ZABBIX_HOST}"
-[[ -n "${IDM_HOST}" ]] && inject_host "${IDM_HOST}"
-inject_host "${GLPI_HOSTNAME}"
+inject_host "${MAIL_IP}"   "${MAIL_HOST}"
+inject_host "${ZABBIX_IP}" "${ZABBIX_HOST}"
+inject_host "${IDM_IP}"    "${IDM_HOST}"
+inject_host "${GLPI_IP}"   "${GLPI_HOSTNAME}"
 
 # ── Section 5: SELinux ────────────────────────────────────────────────────────
 section "5. SELinux — custom policy for rootless Podman"
@@ -340,9 +472,8 @@ section "5. SELinux — custom policy for rootless Podman"
   setsebool -P httpd_can_network_connect 1
   setsebool -P container_manage_cgroup   1 2>/dev/null || true
   setsebool -P nis_enabled               1 2>/dev/null || true
+  ok "SELinux booleans set."
 }
-
-ok "SELinux booleans set."
 
 # ── Section 6: Directories and secrets ───────────────────────────────────────
 section "6. Directories and secrets"
@@ -408,8 +539,8 @@ EOF
   chmod 664 "${GLPI_BASE}/logs/php-fpm-slow.log"
 }
 
-# ── Section 7: PHP + nginx configs ────────────────────────────────────────────
-section "7. Compose configs (PHP-FPM, nginx)"
+# ── Section 7: PHP and nginx configs ──────────────────────────────────────────
+section "7. Container configs (PHP-FPM, nginx)"
 
 write_if_differs "${GLPI_BASE}/php-conf/www.conf" <<'WWWEOF'
 [www]
@@ -490,14 +621,7 @@ server {
 }
 NGINXEOF
 
-write_if_differs "${GLPI_BASE}/glpi-local_define.php" <<'PHPEOF'
-<?php
-define('GLPI_CONFIG_DIR', '/etc/glpi/');
-define('GLPI_VAR_DIR',    '/var/lib/glpi/');
-define('GLPI_LOG_DIR',    '/var/log/glpi/');
-PHPEOF
-
-# ── Section 8: Dockerfile + entrypoint ───────────────────────────────────────
+# ── Section 8: Dockerfile ─────────────────────────────────────────────────────
 section "8. Dockerfile and entrypoint"
 
 write_if_differs "${GLPI_BASE}/Dockerfile.glpi" <<DOCKEREOF
@@ -528,7 +652,6 @@ RUN mkdir -p /etc/glpi /var/lib/glpi /var/log/glpi \\
     && chown -R www-data:www-data /etc/glpi /var/lib/glpi /var/log/glpi
 
 COPY glpi-local_define.php /var/www/glpi/inc/local_define.php
-
 RUN mkdir -p /opt/glpi-snapshot && cp -a /var/www/glpi/. /opt/glpi-snapshot/ && chown -R www-data:www-data /opt/glpi-snapshot
 
 COPY entrypoint.sh /entrypoint.sh
@@ -580,120 +703,20 @@ done
 exec su-exec www-data "$@"
 ENTRYEOF
 
-# ── Section 9: compose.yaml ───────────────────────────────────────────────────
-section "9. compose.yaml"
+write_if_differs "${GLPI_BASE}/glpi-local_define.php" <<'PHPEOF'
+<?php
+define('GLPI_CONFIG_DIR', '/etc/glpi/');
+define('GLPI_VAR_DIR',    '/var/lib/glpi/');
+define('GLPI_LOG_DIR',    '/var/log/glpi/');
+PHPEOF
 
-write_if_differs "${COMPOSE_FILE}" <<'COMPOSEEOF'
-services:
-  glpi-db:
-    image: docker.io/library/mariadb:10.11
-    container_name: glpi-db
-    env_file: [secrets/db.env]
-    volumes:
-      - glpi-mariadb:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: always
-    networks: [glpi-net]
-
-  glpi-app:
-    image: localhost/glpi-app:${GLPI_VERSION}
-    container_name: glpi-app
-    build:
-      context: .
-      dockerfile: Dockerfile.glpi
-    env_file: [secrets/app.env]
-    volumes:
-      - glpi-config:/etc/glpi
-      - glpi-files:/var/lib/glpi
-      - glpi-log:/var/log/glpi
-      - type: bind
-        source: ./webroot
-        target: /srv/glpi-webroot
-        bind:
-          propagation: shared
-      - type: bind
-        source: ./php-conf/glpi.ini
-        target: /usr/local/etc/php/conf.d/glpi.ini
-        read_only: true
-      - type: bind
-        source: ./php-conf/www.conf
-        target: /usr/local/etc/php-fpm.d/www.conf
-        read_only: true
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9000' 2>/dev/null && echo ok || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
-    depends_on:
-      glpi-db:
-        condition: service_healthy
-    restart: always
-    networks: [glpi-net]
-
-  glpi-nginx:
-    image: docker.io/library/nginx:1.26-alpine
-    container_name: glpi-nginx
-    ports:
-      - "127.0.0.1:8081:8082"
-    volumes:
-      - type: bind
-        source: ./nginx-conf/glpi.conf
-        target: /etc/nginx/conf.d/default.conf
-        read_only: true
-      - type: bind
-        source: ./webroot
-        target: /srv/glpi-webroot
-        read_only: true
-        bind:
-          propagation: shared
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8082/healthz || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    depends_on:
-      - glpi-app
-    restart: always
-    networks: [glpi-net]
-
-networks:
-  glpi-net:
-    driver: bridge
-
-volumes:
-  glpi-mariadb:
-    driver: local
-    labels:
-      com.glpi.managed: "true"
-  glpi-config:
-    driver: local
-    labels:
-      com.glpi.managed: "true"
-  glpi-files:
-    driver: local
-    labels:
-      com.glpi.managed: "true"
-  glpi-log:
-    driver: local
-    labels:
-      com.glpi.managed: "true"
-COMPOSEEOF
-
-# ── Section 10: Host nginx ────────────────────────────────────────────────────
-section "10. Host nginx TLS proxy"
+# ── Section 9: Host nginx TLS proxy ───────────────────────────────────────────
+section "9. Host nginx TLS proxy"
 
 CERT_DIR="/etc/pki/tls/certs"
 KEY_DIR="/etc/pki/tls/private"
 
 if [[ ! -f "${CERT_DIR}/${GLPI_HOSTNAME}.crt" ]]; then
-  info "Generating self-signed TLS certificate..."
   [[ $DRY_RUN -eq 0 ]] && \
   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout "${KEY_DIR}/${GLPI_HOSTNAME}.key" \
@@ -702,10 +725,6 @@ if [[ ! -f "${CERT_DIR}/${GLPI_HOSTNAME}.crt" ]]; then
   [[ $DRY_RUN -eq 0 ]] && chmod 400 "${KEY_DIR}/${GLPI_HOSTNAME}.key"
   ok "Certificate generated."
 fi
-
-write_if_differs "/etc/nginx/conf.d/00-glpi-ratelimit.conf" <<'RATELIMITEOF'
-limit_req_zone $binary_remote_addr zone=glpi_login:10m rate=100r/m;
-RATELIMITEOF
 
 write_if_differs "/etc/nginx/conf.d/glpi.conf" <<HOSTNGINXEOF
 upstream glpi_compose {
@@ -720,8 +739,7 @@ server {
 }
 
 server {
-    listen 0.0.0.0:${NGINX_HTTPS_PORT} ssl;
-    http2  on;
+    listen 0.0.0.0:${NGINX_HTTPS_PORT} ssl http2;
     server_name ${GLPI_HOSTNAME};
 
     ssl_certificate     ${CERT_DIR}/${GLPI_HOSTNAME}.crt;
@@ -750,23 +768,21 @@ HOSTNGINXEOF
 
 [[ $DRY_RUN -eq 0 ]] && nginx -t && systemctl restart nginx && ok "nginx configured and restarted."
 
-# ── Section 11: systemd service ───────────────────────────────────────────────
-section "11. systemd unit — glpi-compose.service"
+# ── Section 10: systemd unit ──────────────────────────────────────────────────
+section "10. systemd unit — glpi-compose.service"
 
 write_if_differs "/etc/systemd/system/glpi-compose.service" <<SVCEOF
 [Unit]
-Description=GLPI Podman Compose Stack
+Description=GLPI Podman Stack (rootless)
 After=network-online.target firewalld.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=forking
 User=root
-WorkingDirectory=${GLPI_BASE}
 
-ExecStart=/bin/bash -c 'runuser -l ${GLPI_USER} -s /bin/bash -c "podman-compose -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} up -d"'
-ExecReload=/bin/bash -c 'runuser -l ${GLPI_USER} -s /bin/bash -c "podman-compose -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} up -d"'
-ExecStop=/bin/bash -c 'runuser -l ${GLPI_USER} -s /bin/bash -c "podman-compose -f ${COMPOSE_FILE} -p ${COMPOSE_PROJECT} down --timeout 30"'
+ExecStart=/usr/bin/bash -c 'runuser -l ${GLPI_USER} -s /bin/bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u ${GLPI_USER}) DOCKER_HOST=unix:///run/user/\$(id -u ${GLPI_USER})/podman/podman.sock bash /opt/glpi/start-stack.sh"'
+ExecReload=/usr/bin/bash -c 'runuser -l ${GLPI_USER} -s /bin/bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u ${GLPI_USER}) DOCKER_HOST=unix:///run/user/\$(id -u ${GLPI_USER})/podman/podman.sock bash /opt/glpi/start-stack.sh"'
+ExecStop=/usr/bin/bash -c 'runuser -l ${GLPI_USER} -s /bin/bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u ${GLPI_USER}) DOCKER_HOST=unix:///run/user/\$(id -u ${GLPI_USER})/podman/podman.sock podman stop --time 30 glpi-nginx glpi-app glpi-db"'
 
 TimeoutStartSec=300
 TimeoutStopSec=60
@@ -777,34 +793,50 @@ SVCEOF
 
 [[ $DRY_RUN -eq 0 ]] && systemctl daemon-reload && systemctl enable glpi-compose.service && ok "systemd unit enabled."
 
-# ── Section 12: Start stack ──────────────────────────────────────────────────
-section "12. Start stack"
+# ── Section 11: Build image (if needed) ───────────────────────────────────────
+section "11. Build GLPI container image"
 
-if [[ $DRY_RUN -eq 0 ]]; then
-  compose_down
-  compose_up
-  wait_container_status glpi-app running 60 2 || { run_podman "logs glpi-app --tail 50"; die "glpi-app not running"; }
-  wait_container_status glpi-nginx running 60 2 || { run_podman "logs glpi-nginx --tail 50"; die "glpi-nginx not running"; }
-  ok "Containers started and healthy."
+if [[ $SKIP_BUILD -eq 0 ]]; then
+  if [[ $DRY_RUN -eq 0 ]]; then
+    if run_podman "image exists ${IMG_GLPI_APP}" 2>/dev/null; then
+      warn "Image ${IMG_GLPI_APP} already exists — skipping build."
+    else
+      info "Building ${IMG_GLPI_APP}..."
+      run_podman "build -t ${IMG_GLPI_APP} \
+        --build-arg GLPI_VERSION=${GLPI_VERSION} \
+        --build-arg IMG_PHP=${IMG_PHP} \
+        -f ${GLPI_BASE}/Dockerfile.glpi ${GLPI_BASE}/"
+      ok "Image built successfully."
+    fi
+  fi
+else
+  warn "--skip-build set. Using existing image or defaulting to ${IMG_GLPI_APP}."
 fi
 
-# ── Section 13: DB initialization ────────────────────────────────────────────
-section "13. GLPI DB initialization"
+# ── Section 12: Start stack ───────────────────────────────────────────────────
+section "12. Start container stack"
+
+stack_up
+
+# ── Section 13: DB initialization ─────────────────────────────────────────────
+section "13. Initialize GLPI database"
 
 if [[ $SKIP_DB -eq 1 ]]; then
   warn "--skip-db set. Skipping db:install."
 else
   [[ $DRY_RUN -eq 0 ]] && {
     info "Waiting for glpi-db to be healthy..."
+    wait_container_status glpi-db running 60 2 || { run_podman "logs glpi-db --tail 50"; die "glpi-db failed to start"; }
+
     for _ in $(seq 1 60); do
       s="$(run_podman "inspect glpi-db --format '{{.State.Health.Status}}'" 2>/dev/null || echo none)"
-      [[ "$s" == healthy ]] && break
+      [[ "$s" == "healthy" ]] && break
       sleep 2
     done
 
     TABLE_COUNT="$(run_podman "exec glpi-db mysql -u${MARIADB_USER} -p${DB_PW} ${MARIADB_DATABASE} \
       -e 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\"${MARIADB_DATABASE}\";' \
-      --skip-column-names" 2>/dev/null || echo 0)"
+      --skip-column-names 2>/dev/null" || echo 0)"
     TABLE_COUNT="${TABLE_COUNT//[^0-9]/}"
 
     if [[ "${TABLE_COUNT:-0}" -lt 100 ]]; then
@@ -825,12 +857,8 @@ section "14. Final health checks"
 [[ $DRY_RUN -eq 0 ]] && {
   info "Checking container status..."
   for ctr in glpi-db glpi-app glpi-nginx; do
-    status="$(run_podman "inspect ${ctr} --format '{{.State.Health.Status}}'" 2>/dev/null || echo none)"
-    if [[ "$status" == "healthy" || -z "$status" ]]; then
-      ok "${ctr}: OK"
-    else
-      die "${ctr} is ${status}"
-    fi
+    status="$(run_podman "inspect ${ctr} --format '{{.State.Health.Status}}'" 2>/dev/null || echo unknown)"
+    ok "${ctr}: ${status}"
   done
 
   info "Testing HTTPS access..."
@@ -862,10 +890,6 @@ cat <<NOTES
     • Configure LDAP if needed (Setup > Authentication)
     • Configure Zabbix if needed (Setup > General)
 
-  Backups:
-    systemctl list-timers glpi-backup.timer
-    Retention: ${BACKUP_RETENTION_DAYS} days
-
-  See SETUP.md for full post-install guide.
+  See SETUP.md and CHECK.md for full documentation.
 
 NOTES
