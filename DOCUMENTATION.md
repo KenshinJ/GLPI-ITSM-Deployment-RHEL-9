@@ -454,12 +454,3 @@ Use `--skip-db` if the database is already initialized and does not need re-init
 | TLS cert error | Normal for self-signed | Replace with CA-signed cert in `/etc/pki/tls/` |
 
 ---
-
-## Placeholders Summary
-
-The following values still need to be confirmed and filled in before deployment:
-
-| Placeholder | Description |
-|-------------|-------------|
-| `[PLACEHOLDER: internal-root-ca.crt]` | Internal root CA certificate filename |
-| `[PLACEHOLDER: CA name]` | Common name of the root CA (for `trust list` grep) |
